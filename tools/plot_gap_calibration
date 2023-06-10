@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+
+import argparse
+import pathlib
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+from sinter._main_plot import _common_json_properties, _FieldToMetadataWrapper
+
+MARKERS: str = "ov*sp^<>8PhH+xXDd|" * 100
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('inputs', type=str, nargs='+')
+    parser.add_argument('--chunking', type=int, default=1)
+    parser.add_argument('--filter_func', type=str, default="True")
+    parser.add_argument('--unyoked', action='store_true')
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+    args = parser.parse_args()
+    args.filter_func = eval(compile(
+        f'lambda *, stat, decoder, metadata, m, strong_id: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+    filter_func=lambda stat: args.filter_func(
+        stat=stat,
+        decoder=stat.decoder,
+        metadata=stat.json_metadata,
+        m=_FieldToMetadataWrapper(stat.json_metadata),
+        strong_id=stat.strong_id)
+
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    stats = sinter.read_stats_from_csv_files(*args.inputs)
+    stats = [stat for stat in stats if filter_func(stat)]
+    min_gap = -100
+    if args.unyoked:
+        min_gap = 0
+    max_gap = +100
+    k = 0
+    if not args.unyoked:
+        ax.vlines(0, ymin=1e-20, ymax=10, colors='black', linewidth=2)
+        for stat in stats:
+            xs = []
+            ys = []
+            ys_low = []
+            ys_high = []
+            for g in range(min_gap, max_gap + 1):
+                c = stat.custom_counts[f'C{g}']
+                e = stat.custom_counts[f'E{g}']
+                if e:
+                    fit = sinter.fit_binomial(num_shots=c + e, num_hits=e, max_likelihood_factor=1000)
+                    xs.append(g)
+                    ys.append(fit.best)
+                    ys_low.append(fit.low)
+                    ys_high.append(fit.high)
+            ys = np.array(ys)
+            ys_low = np.array(ys_low)
+            ys_high = np.array(ys_high)
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=(ys - ys_low, ys_high - ys),
+                label=f'd={stat.json_metadata["d"]} rounds={int(stat.json_metadata["r"] / stat.json_metadata["d"])}d (shots={stat.shots} errors={stat.errors})',
+                marker=MARKERS[k],
+                linewidth=0,
+                elinewidth=0.5,
+                capsize=2,
+                zorder=4,
+            )
+            k += 1
+    else:
+        for stat in stats:
+            if stat.json_metadata['d'] not in [5, 7, 9, 11]:
+                continue
+            xs = []
+            ys = []
+            ys_low = []
+            ys_high = []
+            errs = 0
+            for g in range(max_gap + 1):
+                c = stat.custom_counts[f'C{g}']
+                e = stat.custom_counts[f'E{g}']
+                c_inv = stat.custom_counts[f'C{-g}']
+                e_inv = stat.custom_counts[f'E{-g}']
+                if g == 0:
+                    c_inv = 0
+                    e_inv = 0
+                    e += c//2  # Split 'C0' evenly into success and failures.
+                    c //= 2
+                # When the gap is negative, unyoked decoding predicts the opposite.
+                c2 = c
+                e2 = e + c_inv + e_inv  # 'E-#' is still an error.
+                errs += e2
+                if e2:
+                    fit = sinter.fit_binomial(num_shots=c2 + e2, num_hits=e2, max_likelihood_factor=1000)
+                    xs.append(g)
+                    ys.append(fit.best)
+                    ys_low.append(fit.low)
+                    ys_high.append(fit.high)
+            ys = np.array(ys)
+            ys_low = np.array(ys_low)
+            ys_high = np.array(ys_high)
+            ax.errorbar(
+                # Heuristically, we observe the decoder is well-calibrated after rescaling the gap by 0.9x.
+                [0.9 * x for x in xs],
+                ys,
+                yerr=(ys - ys_low, ys_high - ys),
+                label=f'd={stat.json_metadata["d"]} rounds={int(stat.json_metadata["r"] / stat.json_metadata["d"])}d',
+                marker=MARKERS[k],
+                linewidth=0,
+                elinewidth=0.5,
+                capsize=2,
+                zorder=4,
+            )
+            k += 1
+
+    xs = np.array(range(min_gap, max_gap + 1))
+    ys = 1/(1 + 10**(xs / 10))
+    ax.plot(xs, ys, label=r'Perfect Calibration', linestyle='-', color='black', zorder=5)
+    ax.legend()
+
+    # auto_subtitle = ', '.join(f'{k}={v}' for k, v in sorted(_common_json_properties(stats).items()))
+    # auto_subtitle = auto_subtitle.replace('b=magic', 'basis=both (magic time boundaries)')
+    # auto_subtitle = auto_subtitle.replace('c=', 'circuit=')
+    # if args.unyoked:
+    #     auto_subtitle = auto_subtitle.replace('yokes=1', 'yokes=0 (emulated from 1)')
+    # auto_subtitle = auto_subtitle.replace(' p=', ' noise_strength=')
+    # auto_subtitle = '\ngateset'.join(auto_subtitle.split(', gateset'))
+    # ax.set_title(f"Predictability of {'Unyoked' if args.unyoked else 'Yoked'} Logical Error Rate Given Unyoked Gap\n"
+    #              f"{auto_subtitle}")
+    if args.unyoked:
+        ax.set_xlabel("0.9x Gap (g)", fontsize=14)
+    else:
+        ax.set_xlabel("Unyoked Gap * (-1 if yoke changed prediction else +1)", fontsize=14)
+    ax.set_ylabel(r"Sampled P(Logical Error | g) per Shot", fontsize=14)
+    xticks = [d for d in range(min_gap//10*10 - 10, max_gap + 20, 10)]
+    ax.set_xticks(xticks, [f'{x}dB' for x in xticks], rotation='vertical', fontsize=12)
+    ax.set_xlim(min_gap, max_gap - 20)
+    ax.semilogy()
+    ax.set_yticks([10**-k for k in range(10)])
+    ax.set_yticks([b*10**-k for k in range(1, 11) for b in range(2, 10)], minor=True)
+    ax.set_ylim(1e-8, 1e-0)
+    ax.grid(color=(0.5, 0.5, 0.5))
+    ax.grid(color=(0.9, 0.9, 0.9), which='minor')
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+    fig.tight_layout()
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.legend(fontsize=14)
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+
+import argparse
+import dataclasses
+import itertools
+import math
+import pathlib
+from typing import Literal, Optional, Iterable
+
+import numpy as np
+from matplotlib import pyplot as plt
+
+MARKERS: str = "ov*sp^<>8PhH+xXDd|" * 100
+
+
+# These constants are accurate to one sig fig.
+ROUND_EXPONENTS_BY_YOKE = {0: 1, 1: 2, 2: 2, 64: 4}
+PATCH_EXPONENTS_BY_YOKE = {0: 1, 1: 2, 2: 2, 64: 2}
+COST_DIVISORS_BY_YOKE = {0: 20, 1: 200, 2: 500, 64: 200000}
+LAMBDA_BY_YOKE = {0: 3, 1: 8, 2: 8, 64: 50}
+
+
+def extrapolated_error_rate_per_patch_round(
+        *,
+        patch_diameter: float,
+        rounds_between_checks: float,
+        patches_per_group: float,
+        yokes: int,
+) -> float:
+    return (LAMBDA_BY_YOKE[yokes] ** -patch_diameter
+            / COST_DIVISORS_BY_YOKE[yokes]
+            * rounds_between_checks**(ROUND_EXPONENTS_BY_YOKE[yokes] - 1)
+            * patches_per_group**(PATCH_EXPONENTS_BY_YOKE[yokes] - 1))
+
+
+@dataclasses.dataclass(frozen=True)
+class RectangularLayoutWithOverhead:
+    patch_diameter: int
+    rounds_between_checks: int
+    num_rows: int
+    num_cols: int
+    num_logical_qubits: int
+    lerp: float
+    patches_per_group: int
+    num_groups: int
+    storage: str
+    dim0_patch_diameter: Optional[int]
+
+    def coding_rate(self) -> float:
+        if self.storage != 'hot':
+            p_per_patch = 2 * (self.patch_diameter + 1)**2
+            return p_per_patch * self.num_rows * self.num_cols / self.num_logical_qubits
+
+        # For hot storage, we conservatively assume the access hallways have the height of the full code distance.
+        p_per_patch = 2 * (self.patch_diameter + 1) ** 2
+        p_per_access_hallway_patch = 2 * (self.patch_diameter + 1) * (self.dim0_patch_diameter + 1)
+
+        # Assumes we have a tall access hallway servicing every two code blocks.
+        num_access_hallways = (self.num_groups + 1) // 2
+        num_code_rows = self.num_rows - num_access_hallways
+        p_per_rows = p_per_patch * num_code_rows * self.num_cols
+        p_per_access_hallway = p_per_access_hallway_patch * num_access_hallways * self.num_cols
+        return (p_per_rows + p_per_access_hallway) / self.num_logical_qubits
+
+def _make_rectangular_layouts(
+        *,
+        target_lerp: float,
+        storage_type: Literal['hot', 'cold'],
+        min_storage: int,
+        max_storage: int,
+        patches_per_group: int,
+        yokes: int,
+) -> Iterable[RectangularLayoutWithOverhead]:
+    # - Iceberg yokes require even sized groups.
+    # - Yberg yokes don't technically require even sizes, but the odd
+    # stabilizer measurement construction doesn't satisfy boundary
+    # hugging so we avoid it.
+    if yokes > 0 and patches_per_group % 2 == 1:
+        return
+
+    qubits_per_group = patches_per_group - yokes
+    if qubits_per_group <= 0:
+        return
+    min_groups = math.ceil(min_storage / qubits_per_group)
+    max_groups = math.ceil(max_storage / qubits_per_group)
+
+    for groups in range(min_groups, max_groups + 1):
+        if not (min_storage <= qubits_per_group * groups <= max_storage):
+            continue
+        d = 3
+        while True:
+            if storage_type == 'hot':
+                r = d * 50
+                # We target 40% access hallway utilization.
+                if yokes > 0:
+                    stabilizer_measurement_duration = 20 * d  # from hot storage figure
+                    assert stabilizer_measurement_duration / r == 0.4
+            else:
+                # from cold storage figure, the +2 is for walking surface code
+                r = (groups * 8 + 2) * d
+            actual_lerp = extrapolated_error_rate_per_patch_round(
+                patch_diameter=d,
+                rounds_between_checks=r,
+                patches_per_group=patches_per_group,
+                yokes=yokes,
+            )
+
+            # Convert error per patch round to error per logical qubit round.
+            actual_lerp *= patches_per_group / qubits_per_group
+            if actual_lerp <= target_lerp:
+                break
+            if d >= 200:
+                raise NotImplementedError('huge code distance')
+            d += 1
+
+        num_rows = groups
+        num_cols = patches_per_group
+        if storage_type == 'hot':
+            num_cols += 1  # access hallways terminate on this connecting hallway
+            num_rows += (groups + 1) // 2  # access hallways every two rows
+        elif storage_type == 'cold':
+            if yokes > 0:
+                num_rows += 1  # shared workspace hallway
+            if yokes == 1:
+                num_cols += 1  # space to move the ancilla present during measurement
+        else:
+            raise NotImplementedError(f'{storage_type=}')
+
+        # This finds the distance required for a standard surface code to hit the target
+        # logical error rate. This is used for determining the overhead with tall access
+        # hallways in the case of hot storage.
+        d0 = 3
+        while True:
+            ler0 = extrapolated_error_rate_per_patch_round(
+                patch_diameter=d0,
+                rounds_between_checks=1,
+                patches_per_group=1,
+                yokes=0,
+            )
+            if ler0 <= target_lerp:
+                break
+            d0 += 1
+
+        if yokes == 0:
+            assert(d0 == d)
+
+        yield RectangularLayoutWithOverhead(
+            patch_diameter=d,
+            lerp=actual_lerp,
+            num_cols=num_cols,
+            num_rows=num_rows,
+            num_logical_qubits=qubits_per_group * groups,
+            rounds_between_checks=r,
+            patches_per_group=patches_per_group,
+            num_groups=groups,
+            storage=storage_type,
+            dim0_patch_diameter=d0,
+        )
+
+
+def _make_squareberg_layout(
+        *,
+        w: int,
+        target_lerp: float,
+        storage_type: Literal['hot', 'cold'],
+) -> Optional[RectangularLayoutWithOverhead]:
+    if storage_type == 'hot':
+        return None
+
+    d = 3
+    while True:
+        r = d * w * 25 + d * 4  # From cold storage syndrome extraction.
+        patches_per_group = w * w
+
+        actual_lerp = extrapolated_error_rate_per_patch_round(
+            patch_diameter=d,
+            rounds_between_checks=r,
+            patches_per_group=patches_per_group,
+            yokes=4 * w,
+        )
+
+        qubits_per_group = w * w - 4 * w + 2  # Number of logical qubits in 2D QPCCs.
+
+        # Convert error per patch round to error per logical qubit round.
+        actual_lerp *= patches_per_group / qubits_per_group
+        if actual_lerp <= target_lerp:
+            break
+        if d >= 200:
+            raise NotImplementedError('huge code distance')
+        d += 1
+
+    return RectangularLayoutWithOverhead(
+        patch_diameter=d,
+        lerp=actual_lerp,
+        num_cols=w + 1,
+        num_rows=w + 1,
+        num_logical_qubits=w * w - 4 * w + 2,
+        rounds_between_checks=r,
+        patches_per_group=w * w,
+        num_groups=1,
+        storage=storage_type,
+        dim0_patch_diameter=None,
+    )
+
+
+def _make_best_rectangular_layout(
+        *,
+        target_lerp: float,
+        storage_type: Literal['hot', 'cold'],
+        min_storage: int,
+        max_storage: int,
+        min_patches_per_group: int,
+        max_patches_per_group: int,
+        yokes: int,
+) -> Optional[RectangularLayoutWithOverhead]:
+    if yokes not in [0, 2, 64]:
+        return
+    if yokes == 64:
+        return _make_squareberg_layout(w=yokes // 4, target_lerp=target_lerp, storage_type=storage_type)
+    layouts = []
+    for patches_per_group in range(min_patches_per_group, max_patches_per_group + 1):
+        layouts.extend(_make_rectangular_layouts(
+            target_lerp=target_lerp,
+            storage_type=storage_type,
+            min_storage=min_storage,
+            max_storage=max_storage,
+            yokes=yokes,
+            patches_per_group=patches_per_group,
+        ))
+    return min(layouts, key=lambda e: e.coding_rate())
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--min_storage', type=int, default=1)
+    parser.add_argument('--max_storage', type=int)
+    parser.add_argument('--include_squareberg', action='store_true')
+    parser.add_argument('--min_patches_per_group', type=int)
+    parser.add_argument('--max_patches_per_group', type=int)
+    parser.add_argument('--storage', choices=['hot', 'cold'], nargs='+')
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+    args = parser.parse_args()
+
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    min_storage = args.min_storage
+    max_storage = args.max_storage
+    for storage, yokes in itertools.product(args.storage, sorted(LAMBDA_BY_YOKE.keys())):
+        if yokes not in [0, 2, 64]:
+            continue
+        if yokes > 2:
+            if storage == 'hot':
+                continue
+            if not args.include_squareberg:
+                continue
+        xs = []
+        ys = []
+        color = {0: 'C0', 1: 'C1', 2: 'C2', 16: 'C3', 32: 'C4', 64: 'C6'}[yokes]
+        for ler in np.logspace(-18, -3, 400):
+            layout = _make_best_rectangular_layout(
+                target_lerp=ler,
+                storage_type=storage,
+                min_storage=min_storage,
+                max_storage=max_storage,
+                yokes=yokes,
+                min_patches_per_group=args.min_patches_per_group,
+                max_patches_per_group=args.max_patches_per_group,
+            )
+            if layout is None:
+                continue
+            rate = layout.coding_rate()
+            d = layout.patch_diameter
+            r = layout.rounds_between_checks
+
+            xs.append(ler)
+            ys.append(rate)
+            if any(abs(np.log(ler) - np.log(10**-kk)) < 0.05 for kk in [6, 9, 12, 15]):
+                ax.scatter([ler], [rate], color=color, marker='o')
+                ax.annotate(
+                    f'  d={d},m={layout.num_groups},n={layout.patches_per_group}  ' if yokes > 0 else  f'  d={d}',
+                    (ler, rate),
+                    color=color,
+                    rotation=30,
+                    horizontalalignment='right' if yokes in [1, 64] else 'left',
+                    xytext=(0, -60 if yokes in [1, 64] else 0),
+                    textcoords='offset points',
+                    fontsize=12
+                )
+        round_exponent = ROUND_EXPONENTS_BY_YOKE[yokes]
+        patch_exponent = PATCH_EXPONENTS_BY_YOKE[yokes]
+        round_eq = 'r' if round_exponent == 1 else f'r^{round_exponent}'
+        patch_eq = 'n' if patch_exponent == 1 else f'n^{patch_exponent}'
+        xs = np.array(xs)
+        ys = np.array(ys)
+
+        dimension = 0
+        if yokes == 2:
+            dimension = 1
+        if yokes > 2:
+            dimension = 2
+
+        ax.plot(
+            xs,
+            ys,
+            label=rf'dimension={dimension}, extrapolated with $p_L \approx {round_eq} \cdot {patch_eq} \cdot {LAMBDA_BY_YOKE[yokes]}^{{-d}} / {COST_DIVISORS_BY_YOKE[yokes]}$',
+            color=color,
+            linewidth=3,
+        )
+
+        # if yokes == 0:
+        #     ax.plot(
+        #         xs,
+        #         ys * 2 / 3,
+        #         label=rf'    (2/3 physical qubit cost of dimension=0)',
+        #         color=color,
+        #         linestyle='--',
+        #         linewidth=0.8,
+        #     )
+        #     ax.plot(
+        #         xs,
+        #         ys * 0.5,
+        #         label=rf'    (1/2 physical qubit cost of dimension=0)',
+        #         color=color,
+        #         linestyle='-.',
+        #         linewidth=0.8,
+        #     )
+        #     ax.plot(
+        #         xs,
+        #         ys * 1 / 3,
+        #         label=rf'    (1/3 physical qubit cost of dimension=0)',
+        #         color=color,
+        #         linestyle=':',
+        #         linewidth=0.8,
+        #     )
+
+    ax.loglog()
+    xpower = 18
+    ax.set_xticks([10**-k for k in range(xpower + 1)])
+    ax.set_xticks([b*10**-k for k in range(1, xpower + 1) for b in range(2, 10)], minor=True)
+    ax.set_xlim(10**-xpower, 1e-3)
+    ax.set_ylim(10**2, 10**4)
+    ax.grid(color=(0.5, 0.5, 0.5))
+    ax.grid(color=(0.9, 0.9, 0.9), which='minor')
+    ax.legend()
+    ax.set_xlabel('Target error per logical qubit round', fontsize=14)
+    ax.set_ylabel('Physical qubits (including workspace and routing) per logical qubit', fontsize=14)
+    if min_storage == 1:
+        storage_label = f"num stored qubits ≤ {max_storage}"
+    else:
+        storage_label = f"num stored qubits ∈ [{min_storage}, {max_storage}]"
+    ax.set_title(f'Projected footprint of {storage} storage', fontsize=14)
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.legend(fontsize=14)
+    fig.tight_layout()
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

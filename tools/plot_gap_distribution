@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+
+import argparse
+import math
+import pathlib
+import sys
+from typing import Iterable, List
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+from sinter._main_plot import _FieldToMetadataWrapper, _common_json_properties
+
+src_path = pathlib.Path(__file__).parent.parent / 'src'
+assert src_path.exists()
+sys.path.append(str(src_path))
+from yoked._histogram_conversion import \
+    curve_rescaled_to_target_area, \
+    with_unsigned_gap, \
+    histogram_cosine_convolve
+
+
+def chunk(vs: Iterable[float], chunking: int) -> np.ndarray:
+    vs = np.asarray(vs)
+    new_vs = vs[::chunking]
+    for k in range(1, chunking):
+        c = vs[k::chunking]
+        new_vs[:len(c)] += c
+    return new_vs / chunking
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('inputs', type=str, nargs='+')
+    parser.add_argument('--bucket_width', type=int, default=1)
+    parser.add_argument('--filter_func', type=str, default="True")
+    parser.add_argument('--min_gap', type=int, default=-100)
+    parser.add_argument('--ymin', type=float, default=1e-9)
+    parser.add_argument('--max_gap', type=int, default=250)
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--unsigned', action='store_true')
+    parser.add_argument('--emulate_unyoked_decoding', action='store_true')
+    parser.add_argument('--write_success_into_sign', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+
+    args = parser.parse_args()
+    args.filter_func = eval(compile(
+        f'lambda *, stat, decoder, metadata, m, strong_id: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+    filter_func=lambda stat: args.filter_func(
+        stat=stat,
+        decoder=stat.decoder,
+        metadata=stat.json_metadata,
+        m=_FieldToMetadataWrapper(stat.json_metadata),
+        strong_id=stat.strong_id)
+
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    stats: List[sinter.TaskStats] = sinter.read_stats_from_csv_files(*args.inputs)
+    stats = [stat for stat in stats if filter_func(stat)]
+
+    color_index = 0
+    min_gap = args.min_gap
+    max_gap = args.max_gap
+    bucket_width = args.bucket_width
+    write_success_into_sign = args.write_success_into_sign
+    # if args.unsigned or args.emulate_unyoked_decoding or write_success_into_sign:
+    #     stats = [
+    #         with_unsigned_gap(
+    #             stat,
+    #             invert_success_if_negative=args.emulate_unyoked_decoding,
+    #             write_success_into_sign=write_success_into_sign,
+    #         )
+    #         for stat in stats
+    #     ]
+    # if all(float(k[1:]) >= 0 for stat in stats for k in stat.custom_counts):
+    #     min_gap = max(min_gap, 0)
+
+    # ax.plot(
+    #     [],
+    #     [],
+    #     label=f'''successes''',
+    #     color=f'black',
+    #     marker='.',
+    #     linewidth=0,
+    # )
+    # ax.plot(
+    #     [],
+    #     [],
+    #     label=f'''errors''',
+    #     color=f'black',
+    #     marker='x',
+    #     linewidth=0,
+    # )
+    # ax.plot(
+    #     [],
+    #     [],
+    #     label=fr'''successes (smoothed)''',
+    #     color=f'black',
+    #     marker='',
+    # )
+    # ax.plot(
+    #     [],
+    #     [],
+    #     label=fr'''errors (smoothed)''',
+    #     color=f'black',
+    #     marker='',
+    #     linestyle='--',
+    #     linewidth=0.8,
+    # )
+    # ax.plot(
+    #     [],
+    #     [],
+    #     label=f'''$\;$''',
+    #     linewidth=0,
+    #     marker='',
+    # )
+
+    stats = sorted(stats, key=lambda stat: (stat.json_metadata['d'], -stat.json_metadata['r']))
+    for stat in stats:
+        c_hits = {float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'C'}
+        e_hits = {float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'E'}
+        if args.emulate_unyoked_decoding:
+            for k, v in stat.custom_counts.items():  # Convert everything to c_hits for unyoked gaps.
+                if k[0] == 'E':
+                    c_hits[float(k[1:])] += v
+                    e_hits[float(k[1:])] -= v
+        # xs1, ys1 = histogram_bucket_holds(hits=c_hits, bucket_width=bucket_width)
+        # xs1, ys1 = curve_to_curve_between_midpoints(xs=xs1, ys=ys1)
+        xs1, ys1 = histogram_cosine_convolve(hits=c_hits, bucket_width=bucket_width)
+        xs1, ys1 = curve_rescaled_to_target_area(xs=xs1, ys=ys1, expected_total=sum(c_hits.values()) / stat.shots)
+        if write_success_into_sign:
+            e_hits = {k: v for k, v in c_hits.items() if k < 0}
+            c_hits = {k: v for k, v in c_hits.items() if k >= 0}
+            xs1 = np.array(xs1)
+            ys1 = np.array(ys1)
+            ys2 = ys1[xs1 < 0]
+            xs2 = xs1[xs1 < 0]
+            ys1 = ys1[xs1 >= 0]
+            xs1 = xs1[xs1 >= 0]
+        else:
+            xs2, ys2 = histogram_cosine_convolve(hits=e_hits, bucket_width=bucket_width)
+            xs2, ys2 = curve_rescaled_to_target_area(xs=xs2, ys=ys2, expected_total=sum(e_hits.values()) / stat.shots)
+
+        ax.plot(
+            xs1,
+            ys1,
+            color=f'C{color_index}',
+        )
+        ax.plot(
+            xs2,
+            ys2,
+            color=f'C{color_index}',
+            linestyle='--',
+            linewidth=0.8,
+        )
+        ax.scatter(
+            c_hits.keys(),
+            [y / stat.shots for y in c_hits.values()],
+            marker='.',
+            color=f'C{color_index}',
+        )
+        ax.scatter(
+            e_hits.keys(),
+            [y / stat.shots for y in e_hits.values()],
+            marker='x',
+            color=f'C{color_index}',
+        )
+        ax.plot(
+            [],
+            [],
+            label=f'''d={stat.json_metadata['d']}''',
+            color=f'C{color_index}',
+            linewidth=8,
+        )
+        color_index += 1
+
+    ax.legend()
+
+    # auto_subtitle = ', '.join(f'{k}={v}' for k, v in sorted(_common_json_properties(stats).items()))
+    # auto_subtitle = auto_subtitle.replace('b=magic', 'basis=both (magic time boundaries)')
+    # auto_subtitle = auto_subtitle.replace('c=', 'circuit=')
+    # if args.emulate_unyoked_decoding:
+    #     auto_subtitle = auto_subtitle.replace('yokes=1', 'yokes=0 (emulated from 1)')
+    # auto_subtitle = auto_subtitle.replace(' p=', ' noise_strength=')
+    # auto_subtitle = '\ngateset'.join(auto_subtitle.split(', gateset'))
+    #
+    # ax.set_title(f"Sampled Distribution of Unyoked Gaps\n" + auto_subtitle)
+    ax.set_ylabel(f"Probability", fontsize=14)
+    if write_success_into_sign:
+        ax.set_xlabel("Gap * (-1 if error else +1)")
+    elif not args.unsigned and not args.emulate_unyoked_decoding:
+        ax.set_xlabel("Gap * (-1 if yoke changed prediction else +1)")
+    else:
+        ax.set_xlabel("Signed Gap", fontsize=14)
+    xticks = [d for d in range((min_gap)//10*10 - 10, max_gap + 20, 10)]
+    ax.set_xticks(xticks, [f'{x}dB' for x in xticks], rotation='vertical')
+    ax.set_xlim(min_gap, max_gap)
+    ypower = math.ceil(-math.log10(args.ymin))
+    ax.vlines(0, ymin=1e-20, ymax=10, colors='black', linewidth=2)
+    ax.semilogy()
+    ax.set_yticks([10**-k for k in range(ypower + 1)])
+    ax.set_yticks([b*10**-k for k in range(1, ypower + 1) for b in range(2, 10)], minor=True)
+    ax.set_ylim(10**-ypower, 1.5)
+    ax.grid(color=(0.8, 0.8, 0.8), which='minor')
+    ax.grid(color=(0.4, 0.4, 0.4))
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+    fig.tight_layout()
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.legend(fontsize=14)
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

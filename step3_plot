@@ -1,0 +1,156 @@
+#!/bin/bash
+
+set -e
+
+tools/sinter_plot_print \
+    --out assets/bias_memory.png \
+    --in assets/stats.csv \
+    --x_func m.d \
+    --title "Noise Bias while Idling" \
+    --group_func "f'''error={m.custom_error_count_key[-2:].replace('_E', 'Z').replace('E_', 'X').replace('EE', 'Y')} decoder={decoder}'''" \
+    --custom_error_count_keys "obs_mistake_mask=EE" "obs_mistake_mask=_E" "obs_mistake_mask=E_" \
+    --xaxis "Patch Diameter" \
+    --failure_units_per_shot_func "m.r" \
+    --failure_unit_name "patch round" \
+    --plot_args_func "{'color': {'E_': 'C3', '_E': 'C0', 'EE': 'C2'}[m.custom_error_count_key[-2:]], 'marker': {'pymatching': '.', 'fizzle_uncorrelated': 'x', 'finite_match_correlated': 'v', 'sparse_blossom_correlated': 's'}[decoder]}" \
+    --subtitle "{common}, rounds=4d" \
+    --ymin 1e-12 \
+    --xmax 30 \
+    --xmin 0 \
+    --filter_func "m.collect == 'bias' and m.c == 'memory' and decoder in ['pymatching', 'sparse_blossom_correlated', 'fizzle_uncorrelated'] and m.p == 0.001 and m.r == m.d * 4" \
+    --line_fits &
+
+tools/sinter_plot_print \
+    --out assets/bias_patch_rotation.png \
+    --in assets/stats.csv \
+    --x_func m.d \
+    --title "Noise Bias during Patch Rotation" \
+    --group_func "f'''error={m.custom_error_count_key[-2:].replace('_E', 'Z').replace('E_', 'X').replace('EE', 'Y')} decoder={decoder}'''" \
+    --custom_error_count_keys "obs_mistake_mask=EE" "obs_mistake_mask=_E" "obs_mistake_mask=E_" \
+    --xaxis "Patch Diameter" \
+    --failure_units_per_shot_func "m.r" \
+    --failure_unit_name "patch round" \
+    --plot_args_func "{'color': {'E_': 'C3', '_E': 'C0', 'EE': 'C2'}[m.custom_error_count_key[-2:]], 'marker': {'pymatching': '.', 'fizzle_uncorrelated': 'x', 'finite_match_correlated': 'v', 'sparse_blossom_correlated': 's'}[decoder]}" \
+    --subtitle "{common}, rounds=4d" \
+    --ymin 1e-12 \
+    --xmax 30 \
+    --xmin 0 \
+    --filter_func "m.collect == 'bias' and m.c == 'patch_rotation' and decoder in ['pymatching', 'sparse_blossom_correlated', 'fizzle_uncorrelated'] and m.p == 0.001 and m.r == m.d * 4" \
+    --line_fits &
+
+tools/sinter_plot_print \
+    --out assets/errors_yoked_memory_L=4_r=4d.png \
+    --in assets/stats.csv \
+    --title "Logical Error Rate vs Patch Diameter" \
+    --x_func "((m.q - m.patches) / (m.patches - m.yokes))" \
+    --xaxis "[sqrt]Physical Qubits per Logical Qubit (sqrt scale)" \
+    --group_func "f'''yokes={m.yokes} patches={m.patches-m.yokes}+{m.yokes} rounds={int(m.r / m.d)}d'''" \
+    --subtitle "{common}" \
+    --plot_args_func "{'color': f'C{m.yokes}'}" \
+    --filter_func "m.collect is None and m.c == 'memory' and m.p == 0.001 and decoder == 'sparse_blossom_correlated' and m.patches - m.yokes == 4 and m.r / m.d == 4" \
+    --ymin 1e-12 \
+    --xmax 2000 \
+    --xmin 0 \
+    --failure_units_per_shot_func "m.patches * m.r" \
+    --failure_unit_name "patch round" \
+    --failure_values_func "(m.patches - m.yokes) * 2" \
+    --line_fits &
+
+tools/sinter_plot_print \
+    --out assets/errors_yoked_memory_L=8_r=8d.png \
+    --in assets/stats.csv \
+    --title "Logical Error Rate vs Patch Diameter" \
+    --x_func "((m.q - m.patches) / (m.patches - m.yokes))" \
+    --xaxis "[sqrt]Physical Qubits per Logical Qubit (sqrt scale)" \
+    --group_func "f'''yokes={m.yokes} patches={m.patches-m.yokes}+{m.yokes} rounds={int(m.r / m.d)}d'''" \
+    --subtitle "{common}" \
+    --plot_args_func "{'color': f'C{m.yokes}'}" \
+    --filter_func "m.collect is None and m.c == 'memory' and m.p == 0.001 and decoder == 'sparse_blossom_correlated' and m.patches - m.yokes == 8 and m.r / m.d == 8" \
+    --ymin 1e-12 \
+    --xmax 2000 \
+    --xmin 0 \
+    --failure_units_per_shot_func "m.patches * m.r" \
+    --failure_unit_name "patch round" \
+    --failure_values_func "(m.patches - m.yokes) * 2" \
+    --line_fits &
+
+tools/sinter_plot_print \
+    --out assets/errors_yoked_memory_scaling.png \
+    --in assets/stats.csv \
+    --title "Logical Error Rate Scaling vs Patch Rounds" \
+    --x_func "m.patches * m.r" \
+    --xaxis "[log]Patch Rounds" \
+    --group_func "f'''yokes={m.yokes} d={m.d}'''" \
+    --subtitle "{common}" \
+    --plot_args_func "{'color': f'C{m.yokes}'}" \
+    --filter_func "m.collect is None and m.c == 'memory' and m.p == 0.001 and decoder == 'sparse_blossom_correlated' and stat.errors > 5 and m.yokes <= 2" \
+    --ymin 1e-12 \
+    --xmin 10 \
+    --xmax 10000 \
+    --failure_units_per_shot_func "m.patches * m.r" \
+    --failure_unit_name "patch round" \
+    --failure_values_func "(m.patches - m.yokes) * 2" \
+    --line_fits &
+
+tools/plot_gap_distribution \
+    assets/stats.csv \
+    --out assets/gap_distribution.png \
+    --emulate_unyoked \
+    --filter_func "m.p == 0.001 and m.yokes == 1 and m.collect == 'gap'" \
+    --bucket_width 10 &
+
+tools/plot_gap_cumulative_distribution \
+    assets/stats.csv \
+    --filter_func "m.p == 0.001 and m.yokes == 1 and m.collect == 'gap'" \
+    --out assets/gap_cdf_extrapolation.png &
+
+tools/plot_gap_calibration \
+    assets/stats.csv \
+    --unyoked \
+    --filter_func "m.yokes == 1 and m.collect == 'gap'" \
+    --out assets/gap_calibration.png &
+
+tools/plot_gap_distribution \
+    assets/stats.csv \
+    --bucket_width 5 \
+    --filter_func "m.p == 0.001 and m.yokes == 1 and m.collect == 'gap'" \
+    --out assets/gap_distribution_yoked.png &
+
+tools/plot_gap_calibration \
+    assets/stats.csv \
+    --filter_func "m.yokes == 1 and m.collect == 'gap'" \
+    --out assets/gap_calibration_yoked.png &
+
+tools/plot_extrapolations \
+    assets/stats.csv \
+    --filter_func "m.yokes is not None and m.yokes <= 2" \
+    --out assets/extrapolations.png &
+
+tools/plot_extrapolations \
+    assets/stats.csv \
+    --filter_func "m.yokes is not None and m.yokes > 2" \
+    --out assets/extrapolations_squareberg.png &
+
+./tools/plot_extrapolation_footprint \
+    --out assets/footprint_cold.png \
+    --storage cold \
+    --max_storage 250 \
+    --min_patches_per_group 2 \
+    --max_patches_per_group 200 &
+
+./tools/plot_extrapolation_footprint \
+    --out assets/footprint_hot.png \
+    --storage hot \
+    --max_storage 250 \
+    --min_patches_per_group 2 \
+    --max_patches_per_group 200 &
+
+./tools/plot_extrapolation_footprint \
+    --out assets/footprint_cold_squareberg.png \
+    --storage cold \
+    --include_squareberg \
+    --max_storage 250 \
+    --min_patches_per_group 2 \
+    --max_patches_per_group 200 &
+
+wait

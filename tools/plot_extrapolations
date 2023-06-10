@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+
+import argparse
+import dataclasses
+import pathlib
+import re
+from typing import List, Optional, Dict
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+from sinter._main_plot import _FieldToMetadataWrapper
+
+MARKERS: str = "ov*sp^<>8PhH+xXDd|" * 100
+
+
+# These constants are accurate to one sig fig.
+double_yoke_round_exponent = 4
+double_yoke_patch_exponent = 2
+double_yoke_cost_divisor = 200000
+double_yoke_lambda = 50
+ROUND_EXPONENTS_BY_YOKE = {0: 1, 1: 2, 2: 2, 3: 2, 16: double_yoke_round_exponent, 32: double_yoke_round_exponent, 64: double_yoke_round_exponent, 17: double_yoke_round_exponent, 33: double_yoke_round_exponent, 65: double_yoke_round_exponent}
+PATCH_EXPONENTS_BY_YOKE = {0: 1, 1: 2, 2: 2, 3: 2, 16: double_yoke_patch_exponent, 32: double_yoke_patch_exponent, 64: double_yoke_patch_exponent, 17: double_yoke_patch_exponent, 33: double_yoke_patch_exponent, 65: double_yoke_patch_exponent}
+COST_DIVISORS_BY_YOKE = {0: 20, 1: 200, 2: 500, 3: 500, 16: double_yoke_cost_divisor, 32: double_yoke_cost_divisor, 64: double_yoke_cost_divisor, 17: double_yoke_cost_divisor, 33: double_yoke_cost_divisor, 65: double_yoke_cost_divisor}
+LAMBDA_BY_YOKE = {0: 3, 1: 8, 2: 8, 16: double_yoke_lambda, 32: double_yoke_lambda, 64: double_yoke_lambda}
+
+
+def extrapolated_error_rate_per_patch_round(
+        *,
+        patch_diameter: float,
+        rounds_between_checks: float,
+        patches_per_group: float,
+        yokes: int,
+) -> float:
+    return (LAMBDA_BY_YOKE[yokes] ** -patch_diameter
+            / COST_DIVISORS_BY_YOKE[yokes]
+            * rounds_between_checks**(ROUND_EXPONENTS_BY_YOKE[yokes] - 1)
+            * patches_per_group**(PATCH_EXPONENTS_BY_YOKE[yokes] - 1))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('inputs', type=str, nargs='+')
+    parser.add_argument('--filter_func', type=str, default="True")
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+    args = parser.parse_args()
+    args.filter_func = eval(compile(
+        f'lambda *, stat, decoder, metadata, m, strong_id: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+    filter_func=lambda stat: args.filter_func(
+        stat=stat,
+        decoder=stat.decoder,
+        metadata=stat.json_metadata,
+        m=_FieldToMetadataWrapper(stat.json_metadata),
+        strong_id=stat.strong_id)
+    stats: List[sinter.TaskStats] = sinter.read_stats_from_csv_files(*args.inputs)
+    stats = [
+        stat
+        for stat in stats
+        if filter_func(stat)
+        if stat.json_metadata.get('collect') is None
+        if stat.decoder == 'sparse_blossom_correlated'
+    ]
+    stats = sorted(stats, key=lambda stat: (stat.json_metadata['patches'], stat.json_metadata['r'] / stat.json_metadata['d'], stat.json_metadata['d']))
+    @dataclasses.dataclass
+    class YokeFit:
+        sampled: Optional[sinter.Fit]
+        extrapolated: float
+
+    @dataclasses.dataclass
+    class Column:
+        x: float
+        label: str
+        yoke_fits: Dict[int, YokeFit]
+
+    cols: List[Column] = []  # For gap sampled points.
+    cols_raw: List[Column] = []  # For full sim points.
+    x_offset = -1
+    last_d = 999
+    seen_yokes = set()
+    for (_, _, d, _), group in sinter.group_by(stats, key=lambda stat: (stat.json_metadata['patches'], stat.json_metadata['r'] / stat.json_metadata['d'], stat.json_metadata['d'], stat.json_metadata['p'])).items():
+        if d in [last_d + 2, last_d + 1]:
+            x_offset += 0.2
+        else:
+            x_offset += 1
+        col = Column(label='???', yoke_fits={}, x=x_offset)
+        last_d = d
+        cols.append(col)
+        yokes = sinter.group_by(group, key=lambda stat: stat.json_metadata['yokes'])
+        for y in yokes.keys():
+            seen_yokes.add(y)
+            for stat in yokes[y]:
+                y = stat.json_metadata["yokes"]
+                n = stat.json_metadata["patches"]
+                r = stat.json_metadata["r"]
+                d = stat.json_metadata["d"]
+                num_logical_qubits = n - y if y <= 2 else n - y + 2
+                num_outer_rounds = 1
+                match = re.search(r"_r(\d+)_", stat.strong_id)
+                this_col = col
+                if match:
+                    # Strong IDs containing this pattern are gap sampled.
+                    num_outer_rounds = int(match.group(1))
+                else:
+                    # This is a full sim.
+                    col_raw = Column(label='???', yoke_fits={}, x=x_offset)
+                    cols_raw.append(col_raw)
+                    this_col = col_raw
+                this_col.label = f''' n={n} r={int(r / (d * num_outer_rounds))}d d={d}'''
+                e_fit = sinter.fit_binomial(num_shots=stat.shots, num_hits=stat.errors, max_likelihood_factor=1000)
+                conv_e_fit = sinter.shot_error_rate_to_piece_error_rate(e_fit, pieces=r * n, values=num_logical_qubits * 2)
+                e2 = extrapolated_error_rate_per_patch_round(patch_diameter=d, rounds_between_checks=r/num_outer_rounds, patches_per_group=n, yokes=y)
+                this_col.yoke_fits[y] = YokeFit(sampled=None if stat.shots == 0 else conv_e_fit, extrapolated=e2)
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    labels = [col.label for col in cols]
+    for k in range(1, len(labels))[::-1]:
+        cur = labels[k]
+        prev = labels[k - 1]
+        c = 0
+        while c < len(cur) and c < len(prev) and cur[c] == prev[c] and 'r=1000' not in cur:
+            c += 1
+        if c:
+            while cur[c] != ' ':
+                c -= 1
+            if cur[c+1] != 'n':
+                labels[k] = '... ' + cur[c:]
+            else:
+                labels[k] = cur[c:]
+
+    for yokes in LAMBDA_BY_YOKE.keys():
+        if yokes not in seen_yokes:
+            continue
+        xs = []
+        ys = []
+        ys_low = []
+        ys_high = []
+        xs_ex = []
+        ys_ex = []
+        for col in cols + cols_raw:
+            f = col.yoke_fits.get(yokes)
+            if f is not None:
+                if f.sampled is not None:
+                    xs.append(col.x + min(yokes - 1.5, 2)/50)
+                    ys.append(f.sampled.best)
+                    ys_low.append(f.sampled.low)
+                    ys_high.append(f.sampled.high)
+                xs_ex.append(col.x + min(yokes - 1.5, 2)/50)
+                ys_ex.append(f.extrapolated)
+        ys = np.array(ys)
+        ys_low = np.array(ys_low)
+        ys_high = np.array(ys_high)
+        yoke_colors = {0: 'C0', 1: 'C1', 2: 'C2', 16: 'C3', 32: 'C3', 64: 'C3'}
+        yoke_markers = {0: 'o', 1: 's', 2: '^', 16: 'v', 32: 'v', 64: 'v'}
+
+        if len(cols_raw) > 0:  # For comparing against full sims, keep colors consistent.
+            midpoint = (len(xs) + 1) // 2
+            # First half are assumed to be gap simulations. Second half are full simulations.
+            ax.errorbar(
+                xs[:midpoint],
+                ys[:midpoint],
+                yerr=(ys[:midpoint] - ys_low[:midpoint], ys_high[:midpoint] - ys[:midpoint]),
+                linewidth=0,
+                elinewidth=1,
+                capsize=2,
+                marker='o',
+                markersize=7,
+                color='C0',
+                zorder=3,
+                label='gap simulation' if yokes <= 16 else None
+            )
+            ax.errorbar(
+                xs[midpoint:],
+                ys[midpoint:],
+                yerr=(ys[midpoint:] - ys_low[midpoint:], ys_high[midpoint:] - ys[midpoint:]),
+                linewidth=0,
+                elinewidth=1,
+                capsize=2,
+                marker='s',
+                markersize=7,
+                color='C1',
+                zorder=3,
+                label='full simulation' if yokes <= 16 else None
+            )
+
+        else:  # Just plotting the gap simulations.
+            ax.errorbar(
+                xs,
+                ys,
+                yerr=(ys - ys_low, ys_high - ys),
+                linewidth=0,
+                elinewidth=1,
+                capsize=2,
+                marker=yoke_markers[yokes],
+                markersize=7,
+                color=yoke_colors[yokes],
+                zorder=3,
+                label='samples' if yokes <= 16 else None
+            )
+        round_exponent = ROUND_EXPONENTS_BY_YOKE[yokes]
+        patch_exponent = PATCH_EXPONENTS_BY_YOKE[yokes]
+        round_eq = 'r' if round_exponent == 1 else f'r^{round_exponent}'
+        patch_eq = 'n' if patch_exponent == 1 else f'n^{patch_exponent}'
+        yoke_markers = {0: 'x', 1: '+', 2: '1', 16: '2', 32: '2', 64: '2'}
+        yoke_colors = {0: 'C6', 1: 'C7', 2: 'C8', 16: 'C9', 32: 'C9', 64: 'C9'}
+
+        dimension = 0
+        if yokes == 2:
+            dimension = 1
+        if yokes > 2:
+            dimension = 2
+
+        ax.scatter(
+            xs_ex,
+            ys_ex,
+            marker=yoke_markers[yokes],
+            label= rf'dimension={dimension}, extrapolated with $p_L \approx {round_eq} \cdot {patch_eq} \cdot {LAMBDA_BY_YOKE[yokes]}^{{-d}} / {COST_DIVISORS_BY_YOKE[yokes]}$' if yokes <= 16 else None,
+            color=yoke_colors[yokes],
+            zorder=4,
+            s=150 + 50 * (yokes > 0),
+        )
+    ax.semilogy()
+    ypower = 12
+    ax.set_ylim(10**-ypower, 1)
+    ax.set_yticks([10**-k for k in range(ypower + 1)])
+    ax.set_yticks([b*10**-k for k in range(1, ypower + 1) for b in range(2, 10)], minor=True)
+    xs = [col.x for col in cols]
+    ax.set_xticks(xs, labels=labels, rotation=90)
+    ax.set_xlim(min(xs) - 0.5, max(xs) + 0.5)
+    ax.grid(axis='y', color=(0.5, 0.5, 0.5))
+    ax.grid(axis='y', color=(0.9, 0.9, 0.9), which='minor')
+    ax.legend(ncol=1 if len(cols_raw) > 0 else 2, handleheight=2)
+    ax.set_ylabel('Logical Errors per Patch Round')
+    ax.set_title(f'Extrapolated error rates vs sampled error rates')
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+    fig.tight_layout()
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

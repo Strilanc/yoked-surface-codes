@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+
+import argparse
+import collections
+import math
+import pathlib
+import sys
+from typing import Iterable, List
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+from sinter._main_plot import _FieldToMetadataWrapper, _common_json_properties
+
+src_path = pathlib.Path(__file__).parent.parent / 'src'
+assert src_path.exists()
+sys.path.append(str(src_path))
+from yoked._histogram_conversion import \
+    curve_rescaled_to_target_area, \
+    with_unsigned_gap, \
+    histogram_cosine_convolve
+
+
+def chunk(vs: Iterable[float], chunking: int) -> np.ndarray:
+    vs = np.asarray(vs)
+    new_vs = vs[::chunking]
+    for k in range(1, chunking):
+        c = vs[k::chunking]
+        new_vs[:len(c)] += c
+    return new_vs / chunking
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('inputs', type=str, nargs='+')
+    parser.add_argument('--filter_func', type=str, default="True")
+    parser.add_argument('--ymin', type=float, default=1e-9)
+    parser.add_argument('--max_gap', type=int, default=250)
+    parser.add_argument('--include_forward_cdf', action='store_true')
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+
+    args = parser.parse_args()
+    include_forward_cdf = args.include_forward_cdf
+    args.filter_func = eval(compile(
+        f'lambda *, stat, decoder, metadata, m, strong_id: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+    filter_func=lambda stat: args.filter_func(
+        stat=stat,
+        decoder=stat.decoder,
+        metadata=stat.json_metadata,
+        m=_FieldToMetadataWrapper(stat.json_metadata),
+        strong_id=stat.strong_id)
+
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    stats: List[sinter.TaskStats] = sinter.read_stats_from_csv_files(*args.inputs)
+    stats = [stat for stat in stats if filter_func(stat)]
+
+    max_gap = args.max_gap
+    stats = [
+        with_unsigned_gap(
+            stat,
+            invert_success_if_negative=True,
+            write_success_into_sign=False,
+        )
+        for stat in stats
+    ]
+
+    color_index = {7: 0, 9: 1, 11: 2}
+    marker_index = {4: '.', 12: '+'}
+    if include_forward_cdf:
+        ax.plot(
+            [],
+            [],
+            color=f'black',
+            linewidth=1,
+            label=f'''CDF(success)''',
+        )
+    ax.fill_between(
+        [],
+        [],
+        [],
+        color=f'black',
+        alpha=0.3,
+        linewidth=1,
+        linestyle='--',
+    )
+    for stat in stats:
+        c_hits = collections.Counter({float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'C'})
+        e_hits = collections.Counter({float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'E'})
+        for k in range(max_gap + 1):
+            c_hits.setdefault(k, 0)
+            e_hits.setdefault(k, 0)
+        n = sum(c_hits.values()) + sum(e_hits.values())
+
+        # Make everything positive.
+        for k in e_hits.keys():
+            c_hits[k] += e_hits[k]
+            e_hits[k] -= e_hits[k]
+
+        c_xs = np.array(sorted(c_hits.keys()), dtype=np.float64)
+        np.testing.assert_array_equal(c_xs, range(int(max(c_xs)) + 1))
+        c_ys = np.array([v for k, v in sorted(c_hits.items())], dtype=np.float64)
+        c_ys /= n
+
+        e_xs = np.array(sorted(e_hits.keys()), dtype=np.float64)
+        np.testing.assert_array_equal(e_xs, range(int(max(e_xs)) + 1))
+        e_ys = np.array([v for k, v in sorted(e_hits.items())], dtype=np.float64)
+        e_ys /= n
+        e_ys = np.cumsum(e_ys[::-1])[::-1]
+
+        cdf = np.cumsum(c_ys[::-1])[::-1]
+        ax.plot(
+            c_xs[cdf > 0],
+            cdf[cdf > 0],
+            color=f'C{color_index[stat.json_metadata["d"]]}',
+            marker=marker_index[stat.json_metadata["r"]/stat.json_metadata["d"]],
+            markersize=5,
+            linewidth=0,
+        )
+        if include_forward_cdf:
+            cdf = np.cumsum(c_ys)
+            ax.plot(
+                c_xs[cdf > 0],
+                cdf[cdf > 0],
+                color=f'C{color_index[stat.json_metadata["d"]]}',
+                linewidth=1,
+            )
+        ax.plot(
+            e_xs,
+            np.cumsum(e_ys[::-1])[::-1],
+            color=f'C{color_index[stat.json_metadata["d"]]}',
+            marker=marker_index[stat.json_metadata["r"]/stat.json_metadata["d"]],
+            linewidth=0,
+            label=f'''d={stat.json_metadata['d']} rounds={int(stat.json_metadata['r'] / stat.json_metadata['d'])}d''',
+        )
+        if stat.json_metadata['r'] == 4 * stat.json_metadata['d']:
+            cdf = np.cumsum(c_ys[::-1])[::-1]
+            ax.fill_between(
+                c_xs,
+                cdf,
+                cdf**3,
+                color=f'C{color_index[stat.json_metadata["d"]]}',
+                alpha=0.3,
+                linewidth=1,
+                linestyle='--',
+            )
+            ax.plot(
+                c_xs,
+                cdf ** 3,
+                color=f'C{color_index[stat.json_metadata["d"]]}',
+                marker='x',
+                markersize=5,
+                linewidth=0,
+                label=f'''d={stat.json_metadata['d']} rounds={3*int(stat.json_metadata['r'] / stat.json_metadata['d'])}d←{int(stat.json_metadata['r'] / stat.json_metadata['d'])}d'''
+            )
+
+            if include_forward_cdf:
+                cdf = np.cumsum(c_ys)
+                ax.fill_between(
+                    c_xs,
+                    cdf,
+                    1 - (1 - cdf)**3,
+                    color=f'C{color_index[stat.json_metadata["d"]]}',
+                    alpha=0.3,
+                    linewidth=1,
+                    linestyle='--',
+                )
+
+    ax.legend(loc='upper right')
+    ax.set_ylabel(f"Cumulative Probability", fontsize=14)
+    ax.set_xlabel("Gap", fontsize=14)
+    xticks = [d for d in range(0, max_gap + 20, 10)]
+    ax.set_xticks(xticks, [f'{x}dB' for x in xticks], rotation='vertical')
+    ax.set_xlim(0, max_gap)
+    ypower = math.ceil(-math.log10(args.ymin))
+    ax.vlines(0, ymin=1e-20, ymax=10, colors='black', linewidth=2)
+    ax.semilogy()
+    ax.set_yticks([10**-k for k in range(ypower + 1)])
+    ax.set_yticks([b*10**-k for k in range(1, ypower + 1) for b in range(2, 10)], minor=True)
+    ax.set_ylim(10**-ypower, 1)
+    ax.grid(color=(0.8, 0.8, 0.8), which='minor')
+    ax.grid(color=(0.4, 0.4, 0.4))
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+    fig.tight_layout()
+    ax.tick_params(axis='both', which='major', labelsize=12)
+    ax.legend(fontsize=14)
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

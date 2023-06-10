@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+
+import argparse
+import pathlib
+import sys
+from typing import Iterable, List
+
+import numpy as np
+import sinter
+from matplotlib import pyplot as plt
+from sinter._main_plot import _FieldToMetadataWrapper, _common_json_properties
+
+src_path = pathlib.Path(__file__).parent.parent / 'src'
+assert src_path.exists()
+sys.path.append(str(src_path))
+from yoked._histogram_conversion import \
+    histogram_cumulative_meet_in_the_middle, with_unsigned_gap
+
+
+def chunk(vs: Iterable[float], chunking: int) -> np.ndarray:
+    vs = np.asarray(vs)
+    new_vs = vs[::chunking]
+    for k in range(1, chunking):
+        c = vs[k::chunking]
+        new_vs[:len(c)] += c
+    return new_vs / chunking
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('inputs', type=str, nargs='+')
+    parser.add_argument('--filter_func', type=str, default="True")
+    parser.add_argument('--min_gap', type=int, default=-100)
+    parser.add_argument('--max_gap', type=int, default=200)
+    parser.add_argument('--unsigned', action='store_true')
+    parser.add_argument('--emulate_unyoked_decoding', action='store_true')
+    parser.add_argument('--write_success_into_sign', action='store_true')
+    parser.add_argument('--show', action='store_true')
+    parser.add_argument('--out', type=str, default=None)
+
+    args = parser.parse_args()
+    args.filter_func = eval(compile(
+        f'lambda *, stat, decoder, metadata, m, strong_id: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+    filter_func=lambda stat: args.filter_func(
+        stat=stat,
+        decoder=stat.decoder,
+        metadata=stat.json_metadata,
+        m=_FieldToMetadataWrapper(stat.json_metadata),
+        strong_id=stat.strong_id)
+
+    fig: plt.Figure
+    ax: plt.Axes
+    fig, ax = plt.subplots(1, 1)
+    stats: List[sinter.TaskStats] = sinter.read_stats_from_csv_files(*args.inputs)
+    stats = [stat for stat in stats if filter_func(stat)]
+    color_index = 0
+    min_gap = args.min_gap
+    max_gap = args.max_gap
+    write_success_into_sign = args.write_success_into_sign
+    if args.unsigned or args.emulate_unyoked_decoding or write_success_into_sign:
+        stats = [
+            with_unsigned_gap(
+                stat,
+                invert_success_if_negative=args.emulate_unyoked_decoding,
+                write_success_into_sign=write_success_into_sign,
+            )
+            for stat in stats
+        ]
+    if all(float(k[1:]) >= 0 for stat in stats for k in stat.custom_counts):
+        min_gap = max(min_gap, 0)
+
+    stats = sorted(stats, key=lambda stat: (stat.json_metadata['d'], -stat.json_metadata['r']))
+    for stat in stats:
+        c_hits = {float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'C'}
+        e_hits = {float(k[1:]): v for k, v in stat.custom_counts.items() if k[0] == 'E'}
+        xs1, ys1 = histogram_cumulative_meet_in_the_middle(total_hits=stat.shots, hits=c_hits)
+        if write_success_into_sign:
+            xs1 = np.array(xs1)
+            ys1 = np.array(ys1)
+            ys2 = ys1[xs1 < 0]
+            xs2 = xs1[xs1 < 0]
+            ys1 = ys1[xs1 >= 0]
+            xs1 = xs1[xs1 >= 0]
+        else:
+            xs2, ys2 = histogram_cumulative_meet_in_the_middle(total_hits=stat.shots, hits=e_hits)
+
+        ax.plot(
+            [],
+            [],
+            label=f'''d={stat.json_metadata['d']} rounds={stat.json_metadata['r']} patches={stat.json_metadata['patches']}''',
+            color=f'C{color_index}',
+            linewidth=8,
+        )
+        # if stat.json_metadata['r'] == 30:
+        #     c_hits_extrapolate = min_sample_extrapolate(c_hits, 100 / 30)
+        #     xs3, ys3 = histogram_cumulative_meet_in_the_middle(total_hits=stat.shots, hits=c_hits_extrapolate)
+        #     ax.scatter(xs3, ys3, marker='.', color=f'C{color_index}', label='EXTRAPOLATE 100/30')
+        #     c_hits_extrapolate = min_sample_extrapolate(c_hits, 300 / 30)
+        #     xs3, ys3 = histogram_cumulative_meet_in_the_middle(total_hits=stat.shots, hits=c_hits_extrapolate)
+        #     ax.scatter(xs3, ys3, marker='x', color=f'C{color_index}', label='EXTRAPOLATE 300/30')
+        ax.plot(
+            xs1,
+            ys1,
+            marker='.',
+            color=f'C{color_index}',
+            markersize=4,
+        )
+        ax.plot(
+            xs2,
+            ys2,
+            linestyle='--',
+            linewidth=0.8,
+            color=f'C{color_index}',
+            marker='x',
+            markersize=4,
+        )
+        color_index += 1
+
+    common_props = ', '.join(f'{k}={v}' for k, v in sorted(_common_json_properties(stats).items()))
+
+    ax.plot(
+        [],
+        [],
+        label=f'''---------''',
+        linewidth=0,
+        marker='',
+    )
+
+    ax.plot(
+        [],
+        [],
+        label=f'''    errors''',
+        color=f'black',
+        marker='x',
+        linestyle='--',
+        linewidth=0.8,
+    )
+    ax.plot(
+        [],
+        [],
+        label=f'''    successes''',
+        color=f'black',
+        marker='.',
+    )
+
+    ax.legend()
+    ax.set_title(f"Sampled Gaps (meet-in-the-middle cumulative distributions)\n" + common_props)
+    ax.set_ylabel("min(CDF, reversed CDF)")
+    if write_success_into_sign:
+        ax.set_xlabel("Gap * (-1 if error else +1)")
+    elif not args.unsigned and not args.emulate_unyoked_decoding:
+        ax.set_xlabel("Gap * (-1 if yoke changed prediction else +1)")
+    else:
+        ax.set_xlabel("Gap")
+    xticks = [d for d in range((min_gap)//10*10 - 10, max_gap + 20, 10)]
+    ax.set_xticks(xticks, [f'{x}dB' for x in xticks], rotation='vertical')
+    ax.set_xlim(min_gap, max_gap)
+    ypower = 10
+    ax.vlines(0, ymin=1e-20, ymax=10, colors='black', linewidth=2)
+    ax.semilogy()
+    ax.set_yticks([10**-k for k in range(ypower + 1)])
+    ax.set_yticks([b*10**-k for k in range(1, ypower + 1) for b in range(2, 10)], minor=True)
+    ax.set_ylim(10**-ypower, 1.5)
+    ax.grid(color=(0.8, 0.8, 0.8), which='minor')
+    ax.grid(color=(0.4, 0.4, 0.4))
+    fig.tight_layout()
+    fig.set_size_inches(10, 10)
+    fig.set_dpi(100)
+
+    if args.out is not None:
+        fig.savefig(args.out)
+        print(f"wrote file://{pathlib.Path(args.out).absolute()}")
+    if args.show:
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

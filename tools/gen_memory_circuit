@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+
+import argparse
+import itertools
+import math
+import pathlib
+
+import sys
+
+src_path = pathlib.Path(__file__).parent.parent / 'src'
+assert src_path.exists()
+sys.path.append(str(src_path))
+
+import gen
+from yoked._yoked_memory_circuits import yoked_magic_memory_circuit
+from yoked._squareberg_circuits import squareberg_magic_memory_circuit
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--patch_diameter', nargs='+', type=int, required=True)
+    parser.add_argument('--rounds', nargs='+', type=str, required=True)
+    parser.add_argument('--noise_strength', nargs='+', type=float, required=True)
+    parser.add_argument('--filter_func', type=str, default='True')
+    parser.add_argument('--patches', nargs='+', type=str, required=True)
+    parser.add_argument('--yokes', nargs='+', type=int, required=True)
+    parser.add_argument('--gateset', choices=['cz', 'css'], default=['cz'], nargs='+')
+    parser.add_argument('--extra', type=str, default="{}")
+    parser.add_argument('--out_dir', type=str, default='out/circuits')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--remove_x_yoke', action='store_true', default=False)
+    args = parser.parse_args()
+    out_dir = pathlib.Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    args.filter_func = eval(compile(
+        f'lambda *, rounds, patch_diameter, noise_strength, patches, yokes, gateset: {args.filter_func}',
+        filename='filter_func:command_line_arg',
+        mode='eval'))
+
+    for (
+        patch_diameter,
+        rounds_func,
+        noise_strength,
+        patches_func,
+        yokes,
+        gateset,
+    ) in itertools.product(
+        args.patch_diameter,
+        args.rounds,
+        args.noise_strength,
+        args.patches,
+        args.yokes,
+        args.gateset,
+    ):
+        patches = eval(patches_func, {'yokes': yokes})
+        rounds = eval(rounds_func, {'yokes': yokes, 'd': patch_diameter})
+        extras = eval(args.extra, {})
+        if not args.filter_func(
+            patch_diameter=patch_diameter,
+            rounds=rounds,
+            noise_strength=noise_strength,
+            patches=patches,
+            yokes=yokes,
+            gateset=gateset,
+        ):
+            continue
+        if gateset == 'cz':
+            noise = 'si1000'
+            noise_model = gen.NoiseModel.si1000(noise_strength)
+        else:
+            noise = 'uniform'
+            noise_model = gen.NoiseModel.uniform_depolarizing(noise_strength)
+        if yokes > 2:
+            w = round(math.sqrt(patches) / 4) * 4
+            if w * w != patches or yokes != w * 4:
+                raise ValueError(f'{w * w=} != {patches=} or {yokes=} != {w*4=}')
+            circuit = squareberg_magic_memory_circuit(
+                patch_diameter=patch_diameter,
+                rounds=rounds,
+                noise=noise_model,
+                style=gateset,
+                num_patches=patches,
+            )
+        else:
+            circuit = yoked_magic_memory_circuit(
+                patch_diameter=patch_diameter,
+                rounds=rounds,
+                noise=noise_model,
+                style=gateset,
+                yokes=yokes,
+                num_patches=patches,
+                remove_x_yoke=args.remove_x_yoke,
+            )
+        metadata = {
+            'd': patch_diameter,
+            'r': rounds,
+            'p': noise_strength,
+            'patches': patches,
+            'yokes': int(yokes),
+            'noise': noise,
+            'b': 'magic',
+            'c': 'memory',
+            'gateset': gateset,
+            'q': circuit.num_qubits,
+            **extras,
+        }
+        meta_str = ','.join(f'{k}={v}' for k, v in metadata.items())
+        circuit_path = out_dir / f'{meta_str}.stim'
+        circuit.to_file(circuit_path)
+        print(f'wrote {circuit_path}')
+        if args.debug:
+            gen.write_file(out_dir / "debug_noisy.html", gen.stim_circuit_html_viewer(circuit))
+            gen.write_file(out_dir / "debug_ideal.html", gen.stim_circuit_html_viewer(circuit))
+            gen.write_file(out_dir / "debug_detslice.svg", circuit.without_noise().diagram("time+detector-slice-svg"))
+
+
+if __name__ == '__main__':
+    main()

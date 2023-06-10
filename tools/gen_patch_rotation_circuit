@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+
+import argparse
+import itertools
+import pathlib
+
+import sys
+
+src_path = pathlib.Path(__file__).parent.parent / 'src'
+assert src_path.exists()
+sys.path.append(str(src_path))
+
+import gen
+from yoked._patch_rotation import patch_rotation_circuit
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--patch_diameter', nargs='+', type=int, required=True)
+    parser.add_argument('--step_rounds', nargs='+', type=str, required=True)
+    parser.add_argument('--pad_rounds', nargs='+', type=str, required=True)
+    parser.add_argument('--basis', nargs='+', choices=['X', 'Z', 'magic'], required=True)
+    parser.add_argument('--noise_strength', nargs='+', type=float, required=True)
+    parser.add_argument('--gateset', choices=['cz', 'css'], default=['cz'], nargs='+')
+    parser.add_argument('--extra', type=str, default="{}")
+    parser.add_argument('--out_dir', type=str, default='out/circuits')
+    parser.add_argument('--debug', action='store_true')
+    args = parser.parse_args()
+    out_dir = pathlib.Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for (
+        patch_diameter,
+        step_rounds_func,
+        pad_rounds_func,
+        noise_strength,
+        gateset,
+        basis,
+    ) in itertools.product(
+        args.patch_diameter,
+        args.step_rounds,
+        args.pad_rounds,
+        args.noise_strength,
+        args.gateset,
+        args.basis,
+    ):
+        step_rounds = eval(step_rounds_func, {'d': patch_diameter})
+        pad_rounds = eval(pad_rounds_func, {'d': patch_diameter})
+        extras = eval(args.extra, {})
+
+        if gateset == 'cz':
+            noise_name = 'si1000'
+            noise_model = gen.NoiseModel.si1000(noise_strength)
+        else:
+            noise_name = 'uniform'
+            noise_model = gen.NoiseModel.uniform_depolarizing(noise_strength)
+        obj = patch_rotation_circuit(
+            patch_diameter=patch_diameter,
+            pad_rounds=pad_rounds,
+            step_rounds=step_rounds,
+            time_boundaries=basis,
+        )
+        circuit = obj.with_noise(style=gateset, noise=noise_model)
+
+        metadata = {
+            'd': patch_diameter,
+            'r_pad': pad_rounds,
+            'r_step': step_rounds,
+            'p': noise_strength,
+            'b': basis,
+            'noise': noise_name,
+            'gateset': gateset,
+            'c': 'patch_rotation',
+            'q': circuit.num_qubits,
+            'r': (pad_rounds + step_rounds) * 2,
+            **extras,
+        }
+        meta_str = ','.join(f'{k}={v}' for k, v in metadata.items())
+        circuit_path = out_dir / f'{meta_str}.stim'
+        circuit.to_file(circuit_path)
+        print(f'wrote {circuit_path}')
+        if args.debug:
+            obj.steps.write_3d_viewer_html(out_dir / "debug_outline_3d.html")
+            obj.steps.write_patches_svg(out_dir / "debug_patches.svg")
+            obj.steps.write_outlines_svg(out_dir / "debug_outline.svg")
+            gen.write_file(out_dir / "debug_noisy.html", gen.stim_circuit_html_viewer(circuit))
+            gen.write_file(out_dir / "debug_ideal.html", gen.stim_circuit_html_viewer(obj.with_noise(noise=None, style='css')))
+            gen.write_file(out_dir / "debug_detslice.svg", circuit.without_noise().diagram("time+detector-slice-svg"))
+
+
+if __name__ == '__main__':
+    main()

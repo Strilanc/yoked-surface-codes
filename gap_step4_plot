@@ -1,0 +1,51 @@
+#!/bin/bash
+
+set -e
+
+
+parallel -k tools/plot_gap_distribution \
+  out/stats.csv \
+  --bucket_width 5 \
+  --filter_func '"m.r == 100 and m.p == {1} and m.yoked == 1"' \
+  --out '"out/gap_distribution_r100_p{1}.png"' \
+   ::: 0.0005 0.001 0.002
+
+parallel -k tools/plot_gap_mitm_distribution \
+  out/stats.csv \
+  --filter_func '"m.r == 100 and m.p == {1} and m.yoked == 1"' \
+  --out '"out/gap_mitm_distribution_r100_p{1}.png"' \
+   ::: 0.0005 0.001 0.002
+
+parallel -k tools/plot_gap_distribution \
+  out/stats.csv \
+  --bucket_width 5 \
+  --filter_func '"m.d == {1} and m.p == {2} and m.yoked == 1"' \
+  --out '"out/gap_distribution_d{1}_p{2}.png"' \
+  ::: 5 7 9 11 \
+  ::: 0.0005 0.001 0.002
+
+parallel -k tools/plot_gap_distribution \
+  out/stats.csv \
+  --bucket_width 5 \
+  --emulate_unyoked \
+  --filter_func '"m.d == {1} and m.p == {2} and m.yoked == 1"' \
+  --out '"out/gap_distribution_unyoked_d{1}_p{2}.png"' \
+  ::: 5 7 9 11 \
+  ::: 0.0005 0.001 0.002
+
+parallel -k tools/plot_gap_mitm_distribution \
+  out/stats.csv \
+  --filter_func '"m.d == {1} and m.p == {2} and m.yoked == 1"' \
+  --out '"out/gap_mitm_distribution_d{1}_p{2}.png"' \
+  ::: 5 7 9 11 \
+  ::: 0.0005 0.001 0.002
+
+
+
+#PYTHONPATH=../.. \
+#  ./main_plot_gap_dif.py \
+#  out/gap_stats.csv \
+#  --chunking 5 \
+#  --out out/error_given_gap.png &
+
+wait

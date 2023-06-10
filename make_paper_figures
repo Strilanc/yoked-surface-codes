@@ -1,0 +1,62 @@
+#!/bin/bash
+
+set -e
+
+./tools/plot_gap_distribution \
+    assets/stats_gap_distribution.csv \
+    --out assets/gap_distribution.png \
+    --emulate_unyoked \
+    --filter_func "m.collect == 'gap'" \
+    --bucket_width 10 \
+    --max_gap 200 &
+
+./tools/plot_gap_calibration \
+    assets/stats_cdf_extrapolation.csv \
+    --unyoked \
+    --filter_func "m.collect == 'gap'" \
+    --out assets/gap_calibration.png &
+
+./tools/plot_gap_cumulative_distribution \
+    assets/stats_cdf_extrapolation.csv \
+    --filter_func "m.collect == 'gap'" \
+    --out assets/gap_cdf_extrapolation.png &
+
+./tools/plot_extrapolations \
+    assets/stats_check.csv \
+     --filter_func "m.yokes == 0 and m.d in [5, 7, 9, 11] and m.patches in [4, 8]" \
+     --out assets/gap_vs_full_0D.png &
+
+./tools/plot_extrapolations \
+    assets/stats_check.csv \
+     --filter_func "m.yokes == 2 and m.d in [5, 7, 9, 11] and m.patches in [6, 10]" \
+     --out assets/gap_vs_full_1D.png &
+
+./tools/plot_extrapolations \
+    assets/stats_check.csv \
+     --filter_func "m.yokes in [16, 32, 64] and m.d in [3, 4, 5] and m.patches in [16, 64, 256]" \
+     --out assets/gap_vs_full_2D.png &
+
+./tools/plot_extrapolations \
+    assets/stats_extrapolation.csv \
+     --filter_func "m.yokes in [0, 2] and m.d in [7, 8, 9, 10, 11] and m.patches in [8, 16, 32]" \
+     --out assets/gap_0D_and_1D.png &
+
+./tools/plot_extrapolations \
+    assets/stats_extrapolation.csv \
+     --filter_func "m.yokes in [0, 16, 32, 64] and m.d in [7, 8, 9] and m.patches in [16, 64, 256]" \
+     --out assets/gap_0D_and_2D.png &
+
+./tools/plot_extrapolation_footprint \
+    --out assets/footprint_cold.png \
+    --storage cold \
+    --max_storage 250 \
+    --min_patches_per_group 4 \
+    --max_patches_per_group 200 \
+    --include_squareberg &
+
+./tools/plot_extrapolation_footprint \
+    --out assets/footprint_hot.png \
+    --storage hot \
+    --max_storage 250 \
+    --min_patches_per_group 4 \
+    --max_patches_per_group 200 &

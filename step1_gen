@@ -1,0 +1,65 @@
+#!/bin/bash
+
+set -e
+
+parallel -q --ungroup tools/gen_memory_circuit \
+    --patch_diameter {1} \
+    --rounds "d * {2}" \
+    --noise_strength {3} \
+    --patches "{4} + yokes" \
+    --yokes {5} \
+    --gateset "cz" \
+    ::: 3 5 7 9 \
+    ::: 2 4 8 16 \
+    ::: 0.001 0.002 \
+    ::: 1 2 4 8 \
+    ::: 0 1 2
+
+parallel -q --ungroup tools/gen_memory_circuit \
+    --patch_diameter {1} \
+    --rounds "d * 3" \
+    --noise_strength {2} \
+    --patches 1 \
+    --yokes 0 \
+    --gateset "cz" \
+    --extra "{'purpose': 'XYZ_bias'}" \
+    ::: 3 5 7 9 11 13 15 17 19 21 \
+    ::: 0.0005 0.001 0.002
+
+parallel -q --ungroup tools/gen_patch_rotation_circuit \
+    --patch_diameter {1} \
+    --step_rounds "d" \
+    --pad_rounds "d" \
+    --basis "magic" \
+    --noise_strength 5e-4 1e-3 2e-3 \
+    --extra "{'purpose': 'rotation_bias'}" \
+    ::: 3 5 7 9
+
+
+
+### errors_mem
+parallel -q --ungroup tools/gen_memory_circuit \
+    --patch_diameter {1} \
+    --rounds "d*{2}" \
+    --noise_strength {3} \
+    --patches "{4}+yokes" \
+    --yokes {5} \
+    --gateset "cz" \
+    ::: 3 5 7 9 11 \
+    ::: 4 8 16 \
+    ::: 0.0005 0.001 0.002 \
+    ::: 1 2 4 8 \
+    ::: 0 1 2
+
+
+### bias_mem
+parallel -q --ungroup tools/gen_memory_circuit \
+    --patch_diameter {1} \
+    --rounds "4*d" \
+    --noise_strength {2} \
+    --patches "1" \
+    --yokes "0" \
+    --gateset "cz" \
+    --extra "{'collect': 'bias'}" \
+    ::: 5 9 13 17 \
+    ::: 0.0005 0.001 0.002

@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -e
+
+tools/collect_gap \
+    --circuits out/gap_circuits/*.stim \
+    --max_shots 100_000_000 \
+    --processes 12 \
+    --save_resume_filepath out/gap_stats.csv \
+    --flush_period 240

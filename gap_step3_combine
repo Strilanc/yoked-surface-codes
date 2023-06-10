@@ -1,0 +1,7 @@
+#!/bin/bash
+
+set -e
+
+sinter combine \
+  out/gap_stats.csv \
+  > out/gap_stats_combined.csv
